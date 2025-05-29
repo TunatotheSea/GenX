@@ -198,14 +198,15 @@ if not st.session_state.data_loaded:
 with st.sidebar:
     st.header("✨ GenX 채팅")
 
-    st.info(f"**당신의 사용자 ID:** `{st.session_state.user_id}`\n\n이 ID를 기억하여 다음 접속 시 대화 이력을 불러올 수 있습니다.")
-    
-    user_id_input = st.text_input("기존 사용자 ID 입력 (선택 사항)", key="user_id_load_input")
-    if st.button("ID로 대화 불러오기", use_container_width=True):
-        if user_id_input:
-            st.session_state.user_id = user_id_input
-            st.session_state.data_loaded = False # 새 ID로 데이터 다시 로드
-            st.rerun() # 변경된 user_id로 앱 재실행하여 데이터 로드
+    with st.expander("🔑 사용자 ID 관리", expanded=False): # expanded=False로 초기 상태를 접어둡니다.
+        st.info(f"**당신의 사용자 ID:** `{st.session_state.user_id}`\n\n이 ID를 기억하여 다음 접속 시 대화 이력을 불러올 수 있습니다.")
+
+        user_id_input = st.text_input("기존 사용자 ID 입력 (선택 사항)", key="user_id_load_input")
+        if st.button("ID로 대화 불러오기", use_container_width=True):
+            if user_id_input:
+                st.session_state.user_id = user_id_input
+                st.session_state.data_loaded = False # 새 ID로 데이터 다시 로드
+                st.rerun() # 변경된 user_id로 앱 재실행하여 데이터 로드
 
     st.markdown("---") # 구분선
 
@@ -215,7 +216,7 @@ with st.sidebar:
         st.session_state.current_title = "새로운 대화"
         st.session_state.temp_system_instruction = None # 새 대화는 기본 시스템 명령어 사용
         st.session_state.editing_instruction = False
-        
+
         # 새로운 대화 시작 시 Sheets에 current_title 업데이트 (빈 대화로)
         st.session_state.saved_sessions[st.session_state.current_title] = []
         st.session_state.system_instructions[st.session_state.current_title] = default_system_instruction # 빈 시스템 명령어
@@ -226,10 +227,10 @@ with st.sidebar:
         st.subheader("📁 저장된 대화")
         # 최신 대화가 위에 오도록 정렬 (실제 메시지 timestamp가 있다면 더 좋음)
         # 현재는 첫 메시지 텍스트로 정렬 (임시 방편)
-        sorted_keys = sorted(st.session_state.saved_sessions.keys(), 
-                             key=lambda x: st.session_state.saved_sessions[x][0][1] if st.session_state.saved_sessions[x] else "", 
-                             reverse=True)
-        
+        sorted_keys = sorted(st.session_state.saved_sessions.keys(),
+                                    key=lambda x: st.session_state.saved_sessions[x][0][1] if st.session_state.saved_sessions[x] else "",
+                                    reverse=True)
+
         for key in sorted_keys:
             if key == "새로운 대화" and not st.session_state.saved_sessions[key]: # 비어있는 '새로운 대화'는 표시하지 않음
                 continue
@@ -239,17 +240,14 @@ with st.sidebar:
                 st.session_state.chat_history = st.session_state.saved_sessions[key]
                 st.session_state.current_title = key
                 st.session_state.temp_system_instruction = st.session_state.system_instructions.get(key, default_system_instruction)
-                
+
                 # 모델 재로드 및 chat_session 초기화
                 model = load_model(st.session_state.temp_system_instruction)
                 st.session_state.chat_session = model.start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
-                
+
                 st.session_state.editing_instruction = False
                 save_user_data_to_gsheets(gsheets_conn, st.session_state.user_id) # 현재 활성 대화 업데이트
                 st.rerun() # 변경된 대화로 UI 업데이트
-
-    with st.expander("⚙️ 설정"):
-        st.write("여기에 온도, 모델 선택 등의 설정 추가 가능")
 
 # 대화 세션 초기화 (로드된 데이터 기반)
 if st.session_state.chat_session is None:
