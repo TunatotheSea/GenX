@@ -183,6 +183,8 @@ def save_user_data_to_gsheets(conn, user_id):
         
         # 업데이트된 DataFrame을 시트에 다시 쓰기
         conn.write(df, worksheet="UserSessions")
+        st.write("쓰여지는 DataFrame:") # 추가
+        st.write(df) # 추가
         # st.toast("데이터가 저장되었습니다.", icon="💾") # 너무 자주 뜨는 것을 방지하기 위해 주석 처리
     except Exception as e:
         st.error(f"데이터 저장 중 오류 발생: {e}")
