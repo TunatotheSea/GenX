@@ -4,6 +4,7 @@ import os
 import uuid
 import json
 import pandas as pd
+from streamlit_gsheets import GSheetsConnection
 
 # API 키 설정
 # GOOGLE_API_KEY 환경 변수가 설정되어 있어야 합니다.
@@ -19,7 +20,7 @@ def get_gsheets_connection():
     """Google Sheets 연결을 캐시하여 여러 번 초기화되지 않도록 합니다."""
     try:
         # st.connection을 사용하여 Google Sheets 연결
-        conn = st.connection("gsheets", type="gsheets")
+        conn = st.connection("gsheets", type=GSheetsConnection)
         return conn
     except Exception as e:
         st.error(f"Google Sheets 연결 오류: {e}")
