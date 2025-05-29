@@ -269,7 +269,7 @@ if st.session_state.editing_instruction:
     with st.expander("🧠 시스템 명령어 설정", expanded=True):
         st.session_state.temp_system_instruction = st.text_area(
             "System instruction 입력",
-            value=st.session_state.system_instructions.get(st.session_state.current_title, ""),
+            value=st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction),
             height=200,
             key="system_instruction_editor"
         )
