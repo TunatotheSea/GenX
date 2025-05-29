@@ -64,8 +64,9 @@ def load_summary_model():
     )
 
 summary_model = load_summary_model()
+default_system_instruction = "당신의 이름은 GenX입니다. 다만, 이 이름은 다른 이름이 선택되면 잊어버리십시오. 우선순위가 제일 낮습니다."
 
-def load_model(system_instruction=None):
+def load_model(system_instruction=default_system_instruction):
     """지정된 시스템 명령어로 Gemini 모델을 로드합니다."""
     model = gemini.GenerativeModel(
         model_name='gemini-2.0-flash',
@@ -134,7 +135,7 @@ def load_user_data_from_gsheets(conn, user_id):
             st.session_state.temp_system_instruction = None
             
             # 새로운 사용자 ID일 경우 기본 모델 세션 시작
-            model = load_model("당신의 이름은 GenX입니다. 다만, 이 이름은 다른 이름이 선택되면 잊어버리십시오. 우선순위가 제일 낮습니다.")
+            model = load_model()
             st.session_state.chat_session = model.start_chat(history=[])
             
             st.toast(f"새로운 사용자 ID '{user_id}'입니다. 새로운 대화를 시작하세요.", icon="ℹ️")
@@ -146,22 +147,19 @@ def load_user_data_from_gsheets(conn, user_id):
         st.session_state.chat_history = []
         st.session_state.current_title = "새로운 대화"
         st.session_state.temp_system_instruction = None
-        model = load_model("당신의 이름은 GenX입니다. 다만, 이 이름은 다른 이름이 선택되면 잊어버리십시오. 우선순위가 제일 낮습니다.")
+        model = load_model()
         st.session_state.chat_session = model.start_chat(history=[])
 
 
 def save_user_data_to_gsheets(conn, user_id):
     """현재 session_state의 사용자 데이터를 Google Sheets에 저장합니다."""
     try:
-        # 현재 시트의 모든 데이터를 읽어와 DataFrame으로 만듭니다.
-        df = conn.read(worksheet="UserSessions", usecols=list(range(4)), ttl=0) # 캐싱 없이 최신 데이터 읽기
-        
         # 저장할 데이터 준비
         chat_data_to_save = {}
         for title, history_list in st.session_state.saved_sessions.items():
             # Streamlit 형식 대화 이력을 Gemini 형식으로 변환하여 저장
             gemini_history = convert_to_gemini_format(history_list)
-            chat_data_to_save[title] = gemini_history # instruction은 system_instructions에 별도로 저장
+            chat_data_to_save[title] = gemini_history
 
         data_to_save = {
             "user_id": user_id,
@@ -169,24 +167,26 @@ def save_user_data_to_gsheets(conn, user_id):
             "system_instructions_json": json.dumps(st.session_state.system_instructions),
             "last_active_title": st.session_state.current_title
         }
-        
-        # user_id가 이미 존재하는지 확인
-        if user_id in df['user_id'].values:
+
+        df_to_save = pd.DataFrame([data_to_save])
+
+        # 기존 데이터 읽기 (업데이트를 위해)
+        existing_df = conn.read(worksheet="UserSessions", usecols=list(range(4)), ttl=0)
+
+        if existing_df is not None and 'user_id' in existing_df.columns and user_id in existing_df['user_id'].values:
             # 기존 행 업데이트
-            idx = df[df['user_id'] == user_id].index[0]
-            for col, value in data_to_save.items():
-                df.loc[idx, col] = value
+            index = existing_df[existing_df['user_id'] == user_id].index[0]
+            for col in df_to_save.columns:
+                existing_df.loc[index, col] = df_to_save.iloc[0][col]
+            conn.update(worksheet="UserSessions", data=existing_df)
+            # st.toast("데이터가 업데이트되었습니다.", icon="💾")
         else:
             # 새 행 추가
-            new_row_df = pd.DataFrame([data_to_save])
-            df = pd.concat([df, new_row_df], ignore_index=True)
-        
-        # 업데이트된 DataFrame을 시트에 다시 쓰기
-        conn.write(df, worksheet="UserSessions")
-        st.write("쓰여지는 DataFrame:") # 추가
-        st.write(df) # 추가
-        # st.toast("데이터가 저장되었습니다.", icon="💾") # 너무 자주 뜨는 것을 방지하기 위해 주석 처리
+            conn.update(worksheet="UserSessions", data=pd.concat([existing_df, df_to_save], ignore_index=True))
+            # st.toast("새로운 데이터가 저장되었습니다.", icon="💾")
+
     except Exception as e:
+        print(f"데이터 저장 중 오류 발생: {e}")
         st.error(f"데이터 저장 중 오류 발생: {e}")
 
 # 앱 시작 시 또는 사용자 ID 변경 시 데이터 로드
@@ -218,7 +218,7 @@ with st.sidebar:
         
         # 새로운 대화 시작 시 Sheets에 current_title 업데이트 (빈 대화로)
         st.session_state.saved_sessions[st.session_state.current_title] = []
-        st.session_state.system_instructions[st.session_state.current_title] = "" # 빈 시스템 명령어
+        st.session_state.system_instructions[st.session_state.current_title] = default_system_instruction # 빈 시스템 명령어
         save_user_data_to_gsheets(gsheets_conn, st.session_state.user_id)
         st.rerun() # 새로운 대화 상태로 UI 업데이트
 
@@ -238,7 +238,7 @@ with st.sidebar:
             if st.button(f"💬 {display_key}", use_container_width=True, key=f"load_session_{key}"):
                 st.session_state.chat_history = st.session_state.saved_sessions[key]
                 st.session_state.current_title = key
-                st.session_state.temp_system_instruction = st.session_state.system_instructions.get(key, "")
+                st.session_state.temp_system_instruction = st.session_state.system_instructions.get(key, default_system_instruction)
                 
                 # 모델 재로드 및 chat_session 초기화
                 model = load_model(st.session_state.temp_system_instruction)
@@ -254,7 +254,7 @@ with st.sidebar:
 # 대화 세션 초기화 (로드된 데이터 기반)
 if st.session_state.chat_session is None:
     current_instruction = st.session_state.system_instructions.get(
-        st.session_state.current_title, "당신의 이름은 GenX입니다. 다만, 이 이름은 다른 이름이 선택되면 잊어버리십시오. 우선순위가 제일 낮습니다."
+        st.session_state.current_title, default_system_instruction
     )
     model = load_model(current_instruction)
     st.session_state.chat_session = model.start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
