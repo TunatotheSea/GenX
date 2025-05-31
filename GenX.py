@@ -99,6 +99,8 @@ def load_main_model(system_instruction=default_system_instruction):
 def convert_to_gemini_format(chat_history_list):
     gemini_history = []
     for role, text in chat_history_list:
+        # For simplicity, assuming 'text' is always the part for now.
+        # If you later store image data in chat_history, this conversion needs to be more complex.
         gemini_history.append({"role": role, "parts": [{"text": text}]})
     return gemini_history
 
@@ -302,6 +304,21 @@ if st.session_state.editing_instruction:
 # Container to display all chat messages
 chat_display_container = st.container()
 
+# --- Final Chat History Display (Always Rendered) ---
+# This ensures all messages are displayed correctly.
+with chat_display_container:
+    for i, (role, message) in enumerate(st.session_state.chat_history):
+        with st.chat_message("ai" if role == "model" else "user"):
+            st.markdown(message)
+            # Display regenerate button only on the last AI message if not currently generating
+            if role == "model" and i == len(st.session_state.chat_history) - 1 and not st.session_state.is_generating:
+                if st.button("🔄 다시 생성", key=f"regenerate_button_final_{i}", use_container_width=True):
+                    st.session_state.regenerate_requested = True
+                    st.session_state.is_generating = True # Disable input during regeneration
+                    st.session_state.chat_history.pop() # Remove last AI message before regeneration
+                    # No need to rewind chat_session here, it will be reinitialized in the regeneration block
+                    st.rerun()
+
 # --- Input Area ---
 # Place st.chat_input and file uploader on the same line
 col_prompt_input, col_upload_icon = st.columns([0.85, 0.15]) # Adjust column ratio for better spacing
@@ -326,16 +343,15 @@ else:
 # --- Regeneration Logic ---
 # This block runs only when regeneration is requested.
 if st.session_state.regenerate_requested:
-    st.session_state.is_generating = True # Disable input during regeneration
+    st.session_state.is_generating = True # Set generation flag to True
+    
+    # Get the previous user message (which is now the last message after pop() in the button handler)
+    previous_user_message_content = st.session_state.last_user_input_for_regen["text"]
+    previous_user_image_data = st.session_state.last_user_input_for_regen["image"]
+    previous_user_image_mime = st.session_state.last_user_input_for_regen["mime_type"]
+
     with chat_display_container: # Display regenerated message within the chat area
-        # Get the previous user message (which is now the last message after pop())
-        previous_user_message_content = st.session_state.last_user_input_for_regen["text"]
-        previous_user_image_data = st.session_state.last_user_input_for_regen["image"]
-        previous_user_image_mime = st.session_state.last_user_input_for_regen["mime_type"]
-
-        with st.chat_message("user"):
-            st.markdown(previous_user_message_content)
-
+        # The user message is already displayed by the main history loop
         with st.chat_message("ai"):
             message_placeholder = st.empty()
             full_response = ""
@@ -344,8 +360,6 @@ if st.session_state.regenerate_requested:
                 current_instruction = st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction)
                 # The history for the chat session should exclude the user message that is being regenerated.
                 # It should only contain the conversation up to the turn *before* the user's last input.
-                # Since chat_history.pop() removed the AI response, the last item in chat_history is the user's message.
-                # So, we need to exclude this user message from the history passed to start_chat.
                 st.session_state.chat_session = load_main_model(current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history[:-1]))
 
                 regen_contents = [previous_user_message_content]
@@ -357,7 +371,7 @@ if st.session_state.regenerate_requested:
                 for chunk in response_stream:
                     full_response += chunk.text
                     message_placeholder.markdown(full_response + "▌")
-                # Removed: message_placeholder.markdown(full_response) # This caused duplication
+                message_placeholder.markdown(full_response) # Final display without cursor
 
                 st.session_state.chat_history.append(("model", full_response)) # Add new AI message
                 st.session_state.regenerate_requested = False
@@ -392,19 +406,15 @@ if user_prompt is not None and not st.session_state.is_generating:
         st.rerun() # Update UI and start generation immediately after prompt submission
 
 # --- AI Response Generation and Display Logic ---
-# This block runs only when AI is generating a response.
-if st.session_state.is_generating:
+# This block runs only when AI is generating a response (and not regenerating).
+if st.session_state.is_generating and not st.session_state.regenerate_requested:
     with chat_display_container: # Display generating message within the chat area
-        # Display user message immediately
-        with st.chat_message("user"):
-            st.markdown(st.session_state.chat_history[-1][1])
-
+        # The user message is already displayed by the main history loop
         with st.chat_message("ai"):
             message_placeholder = st.empty() # Placeholder for streaming response
             full_response = ""
             try:
                 # Reinitialize chat_session with the history up to the current user message.
-                # This ensures the model's internal history matches the displayed history.
                 current_instruction = st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction)
                 st.session_state.chat_session = load_main_model(current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history[:-1])) # Exclude the very last user message for history initialization
 
@@ -420,7 +430,7 @@ if st.session_state.is_generating:
                 for chunk in response_stream:
                     full_response += chunk.text
                     message_placeholder.markdown(full_response + "▌") # Add blinking cursor for streaming
-                # Removed: message_placeholder.markdown(full_response) # This caused duplication
+                message_placeholder.markdown(full_response) # Final display without cursor
                 
                 st.session_state.chat_history.append(("model", full_response))
                 st.session_state.uploaded_file = None # Reset uploaded file after processing
@@ -443,8 +453,8 @@ if st.session_state.is_generating:
                         while title_key in st.session_state.saved_sessions:
                             title_key = f"{original_title} ({count})"
                             count += 1
-                    st.session_state.current_title = title_key
-                    st.toast(f"대화 제목이 '{title_key}'로 설정되었습니다.", icon="📝")
+                        st.session_state.current_title = title_key
+                        st.toast(f"대화 제목이 '{title_key}'로 설정되었습니다.", icon="📝")
 
                 # Save data to Firestore after successful generation
                 st.session_state.saved_sessions[st.session_state.current_title] = st.session_state.chat_history.copy()
@@ -459,20 +469,3 @@ if st.session_state.is_generating:
             finally:
                 st.rerun() # Rerun UI after generation/error
 
-# --- Final Chat History Display ---
-# This ensures all messages are displayed correctly.
-with chat_display_container:
-    # Only display chat history when AI is not generating.
-    # When generating, the message is displayed directly in the generation block.
-    if not st.session_state.is_generating:
-        for i, (role, message) in enumerate(st.session_state.chat_history):
-            with st.chat_message("ai" if role == "model" else "user"):
-                st.markdown(message)
-                # Display regenerate button only on the last AI message
-                if role == "model" and i == len(st.session_state.chat_history) - 1:
-                    if st.button("🔄 다시 생성", key=f"regenerate_button_final_{i}", use_container_width=True, disabled=st.session_state.is_generating):
-                        st.session_state.regenerate_requested = True
-                        st.session_state.is_generating = True # Disable input during regeneration
-                        st.session_state.chat_history.pop() # Remove last AI message before regeneration
-                        st.session_state.chat_session.rewind() # Rewind the chat session
-                        st.rerun()
