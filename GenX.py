@@ -6,6 +6,8 @@ import uuid
 import json
 import google.generativeai as genai
 from random import randint
+import base64 # For base64 encoding images
+import fitz
 
 # --- Configuration and Initialization ---
 # Gemini API 키 설정
@@ -70,16 +72,16 @@ if "new_title" not in st.session_state:
 # Flag for AI response regeneration request.
 if "regenerate_requested" not in st.session_state:
     st.session_state.regenerate_requested = False
-# Stores the uploaded image file object.
+# Stores the uploaded file object.
 if "uploaded_file" not in st.session_state:
     st.session_state.uploaded_file = None
 # AI is currently generating a response.
 if "is_generating" not in st.session_state:
     st.session_state.is_generating = False
-# Stores the last user message to be regenerated (text and optional image)
-if "last_user_input_for_regen" not in st.session_state:
-    st.session_state.last_user_input_for_regen = None
-# New state for delete confirmation
+# Stores the last user message to be regenerated (TEXT part and optional IMAGE/PDF parts)
+# This will now store the list of content parts ready for Gemini API.
+if "last_user_input_gemini_parts" not in st.session_state:
+    st.session_state.last_user_input_gemini_parts = []
 if "delete_confirmation_pending" not in st.session_state:
     st.session_state.delete_confirmation_pending = False
 if "title_to_delete" not in st.session_state:
@@ -94,6 +96,8 @@ if "supervisor_count" not in st.session_state:
 if "use_supervision" not in st.session_state:
     st.session_state.use_supervision = False 
 
+# Constants
+MAX_PDF_PAGES_TO_PROCESS = 100 # Limit the number of PDF pages to convert to images
 
 default_system_instruction = "당신의 이름은 GenX입니다. 다만, 이 이름은 다른 이름이 선택되면 잊어버리십시오. 우선순위가 제일 낮습니다."
 PERSONA_LIST = [
@@ -197,8 +201,8 @@ summary_model = load_summary_model()
 def convert_to_gemini_format(chat_history_list):
     gemini_history = []
     for role, text in chat_history_list:
-        # For simplicity, assuming 'text' is always the part for now.
-        # If you later store image data in chat_history, this conversion needs to be more complex.
+        # This function only handles text parts for history.
+        # Multimodal inputs (images from PDF, etc.) are handled separately when sending to model.
         gemini_history.append({"role": role, "parts": [{"text": text}]})
     return gemini_history
 
@@ -228,18 +232,22 @@ def evaluate_response(user_input, chat_history, system_instruction, ai_response)
         # await 키워드를 제거하고 generate_content_async 대신 generate_content를 사용합니다.
         supervisor_model = load_supervisor_model(PERSONA_LIST[randint(0, len(PERSONA_LIST)-1)] + "\n" + SYSTEM_INSTRUCTION_SUPERVISOR)
         response = supervisor_model.generate_content(evaluation_prompt)
-        score_text = response.text.strip().split("\n")[0]
+        # Ensure to extract only the score part from the response text
+        score_text_raw = response.text.strip()
+        score_lines = score_text_raw.split("\n")
+        score_value = score_lines[0] if score_lines else "50" # Default to 50 if no score found
+        
         print(f"Supervisor 평가 원본 텍스트: '{response.text}'") # 디버깅을 위해 추가
-        print(f"\n\n\n*** 실제 점수 : {score_text} ***\n\n\n")
+        print(f"\n\n\n*** 실제 점수 : {score_value} ***\n\n\n")
 
         # 점수만 추출하고 정수형으로 변환
-        score = int(score_text)
+        score = int(score_value)
         if not (0 <= score <= 100):
             print(f"경고: Supervisor가 0-100 범위를 벗어난 점수를 반환했습니다: {score}")
             score = max(0, min(100, score)) # 0-100 범위로 강제 조정
         return score
     except ValueError as e:
-        print(f"Supervisor 응답을 점수로 변환하는 데 실패했습니다: {score_text}, 오류: {e}")
+        print(f"Supervisor 응답을 점수로 변환하는 데 실패했습니다: {score_value}, 오류: {e}")
         return 50 # 오류 발생 시 기본 점수 반환
     except Exception as e:
         print(f"Supervisor 모델 호출 중 오류 발생: {e}")
@@ -606,46 +614,91 @@ with col_prompt_input:
                                  disabled=st.session_state.is_generating or st.session_state.delete_confirmation_pending)
 
 with col_upload_icon:
-    # Make the image upload button look like an icon.
-    uploaded_file_for_submit = st.file_uploader("🖼️", type=["png", "jpg", "jpeg"], key="file_uploader_main", label_visibility="collapsed",
-                                                 disabled=st.session_state.is_generating or st.session_state.delete_confirmation_pending, help="이미지 파일을 업로드하세요.")
+    # Make the file upload button look like an icon.
+    # PDF MIME type 'application/pdf' 추가 및 아이콘 변경
+    uploaded_file_for_submit = st.file_uploader("🖼️ / 📄", type=["png", "jpg", "jpeg", "pdf"], key="file_uploader_main", label_visibility="collapsed",
+                                                 disabled=st.session_state.is_generating or st.session_state.delete_confirmation_pending, help="이미지 또는 PDF 파일을 업로드하세요.")
 
 # Update uploaded_file state immediately upon file selection
 if uploaded_file_for_submit:
     st.session_state.uploaded_file = uploaded_file_for_submit
-    st.caption("이미지 업로드 완료")
+    st.caption("파일 업로드 완료")
 else:
     # If user removes the file from the uploader, reset session state as well
     if st.session_state.uploaded_file is not None:
         st.session_state.uploaded_file = None
 
 # AI generation trigger logic
-# Trigger if user_prompt is entered (Enter key) OR if an image is uploaded and user_prompt is empty
+# Trigger if user_prompt is entered (Enter key) OR if a file (image/pdf) is uploaded
 if user_prompt is not None and not st.session_state.is_generating:
     if user_prompt != "" or st.session_state.uploaded_file is not None:
-        st.session_state.chat_history.append(("user", user_prompt)) # Add prompt (can be empty string)
+        # Prepare content for Gemini model
+        user_input_gemini_parts = []
+        # 현재 사용자 프롬프트는 챗봇 히스토리에도 추가될 텍스트입니다.
+        # Supervisor 평가 시 '사용자 입력'으로 사용됩니다.
+        user_prompt_for_display_and_eval = user_prompt if user_prompt else "파일 첨부"
+        
+        # 텍스트 프롬프트는 항상 첫 번째 파트로 추가
+        # user_prompt가 None일 경우 빈 문자열로 초기화하여 오류 방지
+        user_input_gemini_parts.append({"text": user_prompt if user_prompt is not None else ""})
+
+        if st.session_state.uploaded_file:
+            file_type = st.session_state.uploaded_file.type
+            file_data = st.session_state.uploaded_file.getvalue()
+
+            if file_type.startswith("image/"):
+                user_input_gemini_parts.append({
+                    "inline_data": {
+                        "mime_type": file_type,
+                        "data": base64.b64encode(file_data).decode('utf-8') # Base64 인코딩
+                    }
+                })
+            elif file_type == "application/pdf":
+                try:
+                    pdf_document = fitz.open(stream=file_data, filetype="pdf")
+                    processed_page_count = 0
+                    for page_num in range(min(len(pdf_document), MAX_PDF_PAGES_TO_PROCESS)):
+                        page = pdf_document.load_page(page_num)
+                        # Render page to a high-resolution pixmap
+                        # dpi=300 (or higher) for better image quality for OCR/vision tasks
+                        pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72)) 
+                        img_bytes = pix.tobytes() # PNG 형식으로 이미지 바이트 얻기
+                        
+                        user_input_gemini_parts.append({
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": base64.b64encode(img_bytes).decode('utf-8') # Base64 인코딩
+                            }
+                        })
+                        processed_page_count += 1
+                    
+                    if len(pdf_document) > MAX_PDF_PAGES_TO_PROCESS:
+                        st.warning(f"PDF 파일이 {MAX_PDF_PAGES_TO_PROCESS} 페이지를 초과하여 처음 {MAX_PDF_PAGES_TO_PROCESS} 페이지만 처리되었습니다.")
+                    
+                    pdf_document.close() # 문서 닫기
+
+                except Exception as e:
+                    print(f"PDF 파일 처리 중 오류 발생: {e}. PDF 내용을 포함하지 않고 대화를 계속합니다.")
+                    st.error(f"PDF 파일 처리 중 오류 발생: {e}. PDF 내용을 포함하지 않고 대화를 계속합니다.")
+            else:
+                st.warning(f"지원되지 않는 파일 형식입니다: {file_type}. 파일 내용을 포함하지 않고 대화를 계속합니다.")
+
+        # Update chat history with the user's text prompt (not the raw parts for display)
+        # Display용 chat_history에는 텍스트만 저장. 파일이 있었다면 "파일 첨부"와 함께.
+        st.session_state.chat_history.append(("user", user_prompt_for_display_and_eval))
         st.session_state.is_generating = True
-        # Store the current user input (text and image) for potential regeneration
-        st.session_state.last_user_input_for_regen = {
-            "text": user_prompt,
-            "image": st.session_state.uploaded_file.getvalue() if st.session_state.uploaded_file else None,
-            "mime_type": st.session_state.uploaded_file.type if st.session_state.uploaded_file else None
-        }
+        # Store the processed content (Gemini parts) for potential regeneration
+        st.session_state.last_user_input_gemini_parts = user_input_gemini_parts
         st.rerun() # Update UI and start generation immediately after prompt submission
+
 
 # --- Regeneration Logic ---
 # This block runs only when regeneration is requested.
 if st.session_state.regenerate_requested:
     st.session_state.is_generating = True # 생성 플래그를 True로 설정
     
-    # 이전 사용자 메시지 (텍스트 및 이미지 데이터)를 가져옵니다.
-    previous_user_message_content = st.session_state.last_user_input_for_regen["text"]
-    previous_user_image_data = st.session_state.last_user_input_for_regen["image"]
-    previous_user_image_mime = st.session_state.last_user_input_for_regen["mime_type"]
-
-    regen_contents_for_model = [previous_user_message_content]
-    if previous_user_image_data:
-        regen_contents_for_model.append({"inline_data": {"mime_type": previous_user_image_mime, "data": previous_user_image_data}})
+    # 이전 사용자 메시지 (Gemini parts 형식)를 가져옵니다.
+    regen_contents_for_model = st.session_state.last_user_input_gemini_parts
 
     with chat_display_container: # 재생성된 메시지를 채팅 영역 내에 표시
         with st.chat_message("ai"):
@@ -678,9 +731,17 @@ if st.session_state.regenerate_requested:
                         total_score = 0
                         supervisor_feedback_list = []
                         
+                        # Regen 시 Supervisor에게는 원래 사용자 메시지 텍스트를 넘겨야 합니다.
+                        # last_user_input_gemini_parts에서 텍스트 부분만 추출 (가장 첫 번째 텍스트 파트)
+                        original_user_text_for_eval = ""
+                        for part in regen_contents_for_model:
+                            if "text" in part:
+                                original_user_text_for_eval = part["text"]
+                                break 
+
                         for i in range(st.session_state.supervisor_count):
                             score = evaluate_response(
-                                user_input=previous_user_message_content,
+                                user_input=original_user_text_for_eval, # Supervisor에 전달할 사용자 입력
                                 chat_history=st.session_state.chat_history, # Supervisor에게는 현재 사용자 메시지를 포함한 히스토리 제공
                                 system_instruction=current_instruction,
                                 ai_response=full_response
@@ -761,18 +822,67 @@ if st.session_state.regenerate_requested:
 
 
 # AI generation trigger logic
-# Trigger if user_prompt is entered (Enter key) OR if an image is uploaded and user_prompt is empty
+# Trigger if user_prompt is entered (Enter key) OR if a file (image/pdf) is uploaded
 if user_prompt is not None and not st.session_state.is_generating:
     if user_prompt != "" or st.session_state.uploaded_file is not None:
-        st.session_state.chat_history.append(("user", user_prompt)) # Add prompt (can be empty string)
+        # Prepare content for Gemini model
+        user_input_gemini_parts = []
+        # 현재 사용자 프롬프트는 챗봇 히스토리에도 추가될 텍스트입니다.
+        # Supervisor 평가 시 '사용자 입력'으로 사용됩니다.
+        user_prompt_for_display_and_eval = user_prompt if user_prompt else "파일 첨부"
+        
+        # 텍스트 프롬프트는 항상 첫 번째 파트로 추가
+        # user_prompt가 None일 경우 빈 문자열로 초기화하여 오류 방지
+        user_input_gemini_parts.append({"text": user_prompt if user_prompt is not None else ""})
+
+        if st.session_state.uploaded_file:
+            file_type = st.session_state.uploaded_file.type
+            file_data = st.session_state.uploaded_file.getvalue()
+
+            if file_type.startswith("image/"):
+                user_input_gemini_parts.append({
+                    "inline_data": {
+                        "mime_type": file_type,
+                        "data": base64.b64encode(file_data).decode('utf-8') # Base64 인코딩
+                    }
+                })
+            elif file_type == "application/pdf":
+                try:
+                    pdf_document = fitz.open(stream=file_data, filetype="pdf")
+                    processed_page_count = 0
+                    for page_num in range(min(len(pdf_document), MAX_PDF_PAGES_TO_PROCESS)):
+                        page = pdf_document.load_page(page_num)
+                        # Render page to a high-resolution pixmap
+                        # dpi=300 (or higher) for better image quality for OCR/vision tasks
+                        pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72)) 
+                        img_bytes = pix.tobytes(format="png") # PNG 형식으로 이미지 바이트 얻기
+                        
+                        user_input_gemini_parts.append({
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": base64.b64encode(img_bytes).decode('utf-8') # Base64 인코딩
+                            }
+                        })
+                        processed_page_count += 1
+                    
+                    if len(pdf_document) > MAX_PDF_PAGES_TO_PROCESS:
+                        st.warning(f"PDF 파일이 {MAX_PDF_PAGES_TO_PROCESS} 페이지를 초과하여 처음 {MAX_PDF_PAGES_TO_PROCESS} 페이지만 처리되었습니다.")
+                    
+                    pdf_document.close() # 문서 닫기
+
+                except Exception as e:
+                    st.error(f"PDF 파일 처리 중 오류 발생: {e}. PDF 내용을 포함하지 않고 대화를 계속합니다.")
+            else:
+                st.warning(f"지원되지 않는 파일 형식입니다: {file_type}. 파일 내용을 포함하지 않고 대화를 계속합니다.")
+
+        # Update chat history with the user's text prompt (not the raw parts for display)
+        # Display용 chat_history에는 텍스트만 저장. 파일이 있었다면 "파일 첨부"와 함께.
+        st.session_state.chat_history.append(("user", user_prompt_for_display_and_eval))
         st.session_state.is_generating = True
-        # Store the current user input (text and image) for potential regeneration
-        st.session_state.last_user_input_for_regen = {
-            "text": user_prompt,
-            "image": st.session_state.uploaded_file.getvalue() if st.session_state.uploaded_file else None,
-            "mime_type": st.session_state.uploaded_file.type if st.session_state.uploaded_file else None
-        }
+        # Store the processed content (Gemini parts) for potential regeneration
+        st.session_state.last_user_input_gemini_parts = user_input_gemini_parts
         st.rerun() # Update UI and start generation immediately after prompt submission
+
 
 # --- AI Response Generation and Display Logic ---
 # This block runs only when AI is generating a response (and not regenerating).
@@ -785,17 +895,11 @@ if st.session_state.is_generating and not st.session_state.regenerate_requested:
             best_ai_response = "" # Supervision 후 가장 좋은 답변을 저장
             highest_score = -1    # 가장 높은 점수를 저장
             
-            current_user_prompt_text = st.session_state.chat_history[-1][1] # 마지막 추가된 사용자 메시지 텍스트
-            current_user_image_data = st.session_state.last_user_input_for_regen["image"]
-            current_user_image_mime = st.session_state.last_user_input_for_regen["mime_type"]
-
-            # 모델에 보낼 초기 콘텐츠를 준비합니다.
-            initial_contents_for_model = [current_user_prompt_text]
-            if current_user_image_data:
-                initial_contents_for_model.append({"inline_data": {"mime_type": current_user_image_mime, "data": current_user_image_data}})
+            # 모델에 보낼 콘텐츠는 last_user_input_gemini_parts에서 가져옵니다.
+            initial_contents_for_model = st.session_state.last_user_input_gemini_parts
 
             current_instruction = st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction)
-            history_for_main_model = st.session_state.chat_history[:-1]
+            history_for_main_model = st.session_state.chat_history[:-1] # 마지막 사용자 메시지 제외한 히스토리
 
             if st.session_state.use_supervision: # Supervision 토글이 켜져 있을 때만 루프 실행
                 attempt_count = 0
@@ -810,7 +914,7 @@ if st.session_state.is_generating and not st.session_state.regenerate_requested:
                             history=convert_to_gemini_format(history_for_main_model)
                         )
 
-                        # 모델에 현재 사용자 입력(및 이미지)을 전송하여 답변을 스트리밍합니다.
+                        # 모델에 현재 사용자 입력(및 파일 내용)을 전송하여 답변을 스트리밍합니다.
                         response_stream = st.session_state.chat_session.send_message(initial_contents_for_model, stream=True)
                         
                         for chunk in response_stream:
@@ -822,9 +926,17 @@ if st.session_state.is_generating and not st.session_state.regenerate_requested:
                         total_score = 0
                         supervisor_feedback_list = []
                         
+                        # Supervisor에 전달할 사용자 입력 텍스트 추출 (Gemini parts에서)
+                        user_text_for_eval = ""
+                        for part in initial_contents_for_model:
+                            if "text" in part:
+                                # PDF 내용이 포함된 텍스트일 수 있으므로, 사용자의 원래 프롬프트가 가장 앞선다고 가정
+                                user_text_for_eval = part["text"]
+                                break
+
                         for i in range(st.session_state.supervisor_count):
                             score = evaluate_response(
-                                user_input=current_user_prompt_text,
+                                user_input=user_text_for_eval, # Supervisor에 전달할 사용자 입력 텍스트
                                 chat_history=st.session_state.chat_history[:-1], # Supervisor에게는 현재 사용자 입력 제외한 히스토리 제공
                                 system_instruction=current_instruction,
                                 ai_response=full_response
@@ -845,7 +957,7 @@ if st.session_state.is_generating and not st.session_state.regenerate_requested:
                             break # 통과했으므로 루프 종료
                         else:
                             st.warning(f"❌ 답변이 Supervision 통과 기준({st.session_state.supervision_threshold}점)을 만족하지 못했습니다. 재시도합니다...")
-                            if avg_score > highest_score: # 현재 답변이 이전 최고 점수보다 높으면 저장
+                            if avg_score > highest_score:
                                 highest_score = avg_score
                                 best_ai_response = full_response
 
@@ -928,4 +1040,3 @@ if st.session_state.is_generating and not st.session_state.regenerate_requested:
             save_user_data_to_firestore(st.session_state.user_id)
             
             st.rerun() # UI 업데이트를 위해 다시 실행
-

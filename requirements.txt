@@ -2,3 +2,4 @@ streamlit
 firebase-admin
 google-generativeai
 Pillow
+PyMuPDF
