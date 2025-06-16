@@ -166,21 +166,22 @@ SYSTEM_INSTRUCTION_SUPERVISOR = """
 
 출력 형식:
 
-우선, 오직 하나의 정수 값 (0-100)만 출력하세요. 다른 텍스트나 설명은 일절 포함하지 마십시오.
-그 다다음 줄부터 왜 그런 점수가 나왔는지 서술하세요. 각 항목들에 대해 명확하게 각각 몇 점을 주었는지, 무엇에서 감점당했는지 서술하시오.
-예시:
-73
-
-내가 이 점수를 매기게 된 것은 다음과 같은 이유에서다.
-1. 사용자 의도 부합성
-1.1 질문의 핵심 파악 (?/5): ~~~
-1.2 명확하고 직접적인 응답 (?/5): ~~~
-1.3 정보의 완전성 (?/5): ~~~
-1.4 목적 충족 (?/5): ~~~
-1.5 추가적인 도움 제공 (?/5): ~~~
-1.6 적절한 용어 수준 (?/5): ~~~
-...
+오직 하나의 정수 값 (0-100)만 출력하세요. 다른 텍스트나 설명은 일절 포함하지 마십시오.
 """
+
+# 그 다다음 줄부터 왜 그런 점수가 나왔는지 서술하세요. 각 항목들에 대해 명확하게 각각 몇 점을 주었는지, 무엇에서 감점당했는지 서술하시오.
+# 예시:
+# 73
+
+# 내가 이 점수를 매기게 된 것은 다음과 같은 이유에서다.
+# 1. 사용자 의도 부합성
+# 1.1 질문의 핵심 파악 (?/5): ~~~
+# 1.2 명확하고 직접적인 응답 (?/5): ~~~
+# 1.3 정보의 완전성 (?/5): ~~~
+# 1.4 목적 충족 (?/5): ~~~
+# 1.5 추가적인 도움 제공 (?/5): ~~~
+# 1.6 적절한 용어 수준 (?/5): ~~~
+# ...
 
 # Loads main chat model (cached).
 def load_main_model(system_instruction=default_system_instruction):
@@ -233,21 +234,30 @@ def evaluate_response(user_input, chat_history, system_instruction, ai_response)
         supervisor_model = load_supervisor_model(PERSONA_LIST[randint(0, len(PERSONA_LIST)-1)] + "\n" + SYSTEM_INSTRUCTION_SUPERVISOR)
         response = supervisor_model.generate_content(evaluation_prompt)
         # Ensure to extract only the score part from the response text
-        score_text_raw = response.text.strip()
-        score_lines = score_text_raw.split("\n")
-        score_value = score_lines[0] if score_lines else "50" # Default to 50 if no score found
-        
-        print(f"Supervisor 평가 원본 텍스트: '{response.text}'") # 디버깅을 위해 추가
-        print(f"\n\n\n*** 실제 점수 : {score_value} ***\n\n\n")
+        score_text = response.text.strip()
 
         # 점수만 추출하고 정수형으로 변환
-        score = int(score_value)
+        score = int(score_text)
         if not (0 <= score <= 100):
             print(f"경고: Supervisor가 0-100 범위를 벗어난 점수를 반환했습니다: {score}")
             score = max(0, min(100, score)) # 0-100 범위로 강제 조정
         return score
+
+        # score_text_raw = response.text.strip()
+        # score_lines = score_text_raw.split("\n")
+        # score_value = score_lines[0] if score_lines else "50" # Default to 50 if no score found
+        
+        # print(f"Supervisor 평가 원본 텍스트: '{response.text}'") # 디버깅을 위해 추가
+        # print(f"\n\n\n*** 실제 점수 : {score_value} ***\n\n\n")
+
+        # # 점수만 추출하고 정수형으로 변환
+        # score = int(score_value)
+        # if not (0 <= score <= 100):
+        #     print(f"경고: Supervisor가 0-100 범위를 벗어난 점수를 반환했습니다: {score}")
+        #     score = max(0, min(100, score)) # 0-100 범위로 강제 조정
+        # return score
     except ValueError as e:
-        print(f"Supervisor 응답을 점수로 변환하는 데 실패했습니다: {score_value}, 오류: {e}")
+        print(f"Supervisor 응답을 점수로 변환하는 데 실패했습니다: {score_text}, 오류: {e}")
         return 50 # 오류 발생 시 기본 점수 반환
     except Exception as e:
         print(f"Supervisor 모델 호출 중 오류 발생: {e}")
