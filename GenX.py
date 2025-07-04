@@ -6,8 +6,9 @@ import uuid
 import json
 import google.generativeai as genai
 from random import randint
+import io
 import base64 # For base64 encoding images
-import fitz
+import fitz # PyMuPDF for PDF processing - Make sure to install: pip install PyMuPDF
 
 # --- Configuration and Initialization ---
 # Gemini API 키 설정
@@ -95,11 +96,35 @@ if "supervisor_count" not in st.session_state:
 # New: Toggle for Supervision - 기본 설정은 안 쓴다
 if "use_supervision" not in st.session_state:
     st.session_state.use_supervision = False 
+# New: Selected model
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "gemini-2.5-flash" # Default model
 
 # Constants
 MAX_PDF_PAGES_TO_PROCESS = 100 # Limit the number of PDF pages to convert to images
+AVAILABLE_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]
+
+SUPER_INTRODUCTION_HEAD = """
+Make sure to think step-by-step when answering
+
+제 1원칙
+잘 모를 경우 "모르겠습니다"라고 명확히 밝힐 것.
+추측일 경우 "추측입니다."라고 명시할 것.
+출처가 불분명한 정보는 "(확실하지 않음)"이라고 표시할 것.
+단정짓지 말고, 근거가 있다면 함께 제시할 것.
+애매한 질문은 먼저 맥락과 상황을 물어볼 것.
+출처나 참고자료가 있다면 간단히 요약해서 알려줄 것.
+"""
+
+SUPER_INTRODUCTION_TAIL = """
+
+think about it step-by-step always
+
+"""
+
 
 default_system_instruction = "당신의 이름은 GenX입니다. 다만, 이 이름은 다른 이름이 선택되면 잊어버리십시오. 우선순위가 제일 낮습니다."
+
 PERSONA_LIST = [
     "당신은 매우 활발하고 외향적인 성격입니다. 챗봇의 답변이 생동감 넘치고 에너지 넘치는지 평가하십시오. 사용자와 적극적으로 소통하고 즐거움을 제공하는지 중요하게 생각합니다.",
     "당신은 비관적인 성격으로, 모든 일에 부정적인 측면을 먼저 바라봅니다. 챗봇의 답변에서 발생 가능한 문제점이나 오류를 날카롭게 지적하고, 위험 요소를 사전에 감지하는 데 집중하십시오.",
@@ -184,19 +209,23 @@ SYSTEM_INSTRUCTION_SUPERVISOR = """
 # ...
 
 # Loads main chat model (cached).
-def load_main_model(system_instruction=default_system_instruction):
+@st.cache_resource
+def load_main_model(model_name, system_instruction=SUPER_INTRODUCTION_HEAD + default_system_instruction + SUPER_INTRODUCTION_TAIL):
     # Gemini 2.0 Flash supports multimodal input and is fast.
-    model = genai.GenerativeModel(model_name='gemini-2.0-flash', system_instruction=system_instruction)
+    model = genai.GenerativeModel(model_name=model_name, system_instruction=SUPER_INTRODUCTION_HEAD + system_instruction + SUPER_INTRODUCTION_TAIL)
     return model
 
-def load_supervisor_model(system_instruction=SYSTEM_INSTRUCTION_SUPERVISOR):
-    return genai.GenerativeModel(model_name='gemini-2.0-flash', system_instruction=system_instruction)
+@st.cache_resource
+def load_supervisor_model(model_name, system_instruction=default_system_instruction):
+    return genai.GenerativeModel(model_name=model_name, system_instruction=SUPER_INTRODUCTION_HEAD + system_instruction + SUPER_INTRODUCTION_TAIL)
 
 @st.cache_resource
-def load_summary_model():
-    return genai.GenerativeModel('gemini-2.0-flash') # Use Flash model for faster summarization
+def load_summary_model(model_name):
+    return genai.GenerativeModel(model_name) # Use Flash model for faster summarization
 
-summary_model = load_summary_model()
+# Initialize summary_model with the currently selected model
+# This ensures that when the selected_model state changes, this cached function is re-run.
+summary_model = load_summary_model(st.session_state.selected_model) 
 
 # Converts Streamlit chat history to Gemini API format.
 def convert_to_gemini_format(chat_history_list):
@@ -231,7 +260,7 @@ def evaluate_response(user_input, chat_history, system_instruction, ai_response)
     
     try:
         # await 키워드를 제거하고 generate_content_async 대신 generate_content를 사용합니다.
-        supervisor_model = load_supervisor_model(PERSONA_LIST[randint(0, len(PERSONA_LIST)-1)] + "\n" + SYSTEM_INSTRUCTION_SUPERVISOR)
+        supervisor_model = load_supervisor_model(st.session_state.selected_model, PERSONA_LIST[randint(0, len(PERSONA_LIST)-1)] + "\n" + SYSTEM_INSTRUCTION_SUPERVISOR)
         response = supervisor_model.generate_content(evaluation_prompt)
         # Ensure to extract only the score part from the response text
         score_text = response.text.strip()
@@ -243,19 +272,6 @@ def evaluate_response(user_input, chat_history, system_instruction, ai_response)
             score = max(0, min(100, score)) # 0-100 범위로 강제 조정
         return score
 
-        # score_text_raw = response.text.strip()
-        # score_lines = score_text_raw.split("\n")
-        # score_value = score_lines[0] if score_lines else "50" # Default to 50 if no score found
-        
-        # print(f"Supervisor 평가 원본 텍스트: '{response.text}'") # 디버깅을 위해 추가
-        # print(f"\n\n\n*** 실제 점수 : {score_value} ***\n\n\n")
-
-        # # 점수만 추출하고 정수형으로 변환
-        # score = int(score_value)
-        # if not (0 <= score <= 100):
-        #     print(f"경고: Supervisor가 0-100 범위를 벗어난 점수를 반환했습니다: {score}")
-        #     score = max(0, min(100, score)) # 0-100 범위로 강제 조정
-        # return score
     except ValueError as e:
         print(f"Supervisor 응답을 점수로 변환하는 데 실패했습니다: {score_text}, 오류: {e}")
         return 50 # 오류 발생 시 기본 점수 반환
@@ -287,8 +303,8 @@ def load_user_data_from_firestore(user_id):
             st.session_state.temp_system_instruction = st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction)
             current_instruction = st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction)
 
-            # chat_session을 로드된 데이터로 초기화
-            st.session_state.chat_session = load_main_model(current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
+            # chat_session을 로드된 데이터로 초기화 (현재 선택된 모델 사용)
+            st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
             st.toast(f"Firestore에서 사용자 ID '{user_id}'의 데이터를 불러왔습니다.", icon="✅")
         else:
             st.session_state.saved_sessions = {}
@@ -296,8 +312,8 @@ def load_user_data_from_firestore(user_id):
             st.session_state.chat_history = []
             st.session_state.current_title = "새로운 대화"
             st.session_state.temp_system_instruction = default_system_instruction # Explicitly set default
-            # 새로운 대화에 대한 chat_session 초기화
-            st.session_state.chat_session = load_main_model(default_system_instruction).start_chat(history=[])
+            # 새로운 대화에 대한 chat_session 초기화 (현재 선택된 모델 사용)
+            st.session_state.chat_session = load_main_model(st.session_state.selected_model, default_system_instruction).start_chat(history=[])
             st.toast(f"Firestore에 사용자 ID '{user_id}'에 대한 데이터가 없습니다. 새로운 대화를 시작하세요.", icon="ℹ️")
     except Exception as e:
         error_message = f"Firestore에서 데이터 로드 중 오류 발생: {e}"
@@ -309,7 +325,7 @@ def load_user_data_from_firestore(user_id):
         st.session_state.chat_history = []
         st.session_state.current_title = "새로운 대화"
         st.session_state.temp_system_instruction = default_system_instruction # Explicitly set default
-        st.session_state.chat_session = load_main_model().start_chat(history=[])
+        st.session_state.chat_session = load_main_model(st.session_state.selected_model).start_chat(history=[])
 
 # Firestore에 사용자 데이터를 저장합니다.
 def save_user_data_to_firestore(user_id):
@@ -343,7 +359,7 @@ if st.session_state.chat_session is None:
     current_instruction = st.session_state.system_instructions.get(
         st.session_state.current_title, default_system_instruction
     )
-    st.session_state.chat_session = load_main_model(current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
+    st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
 
 # --- Sidebar UI ---
 with st.sidebar:
@@ -382,8 +398,8 @@ with st.sidebar:
         # "새로운 대화"에 대한 시스템 명령어 설정
         st.session_state.system_instructions[st.session_state.current_title] = default_system_instruction
 
-        # 새로운 chat_session을 즉시 초기화
-        st.session_state.chat_session = load_main_model(default_system_instruction).start_chat(history=[])
+        # 새로운 chat_session을 즉시 초기화 (현재 선택된 모델 사용)
+        st.session_state.chat_session = load_main_model(st.session_state.selected_model, default_system_instruction).start_chat(history=[])
 
         save_user_data_to_firestore(st.session_state.user_id)
         st.rerun()
@@ -412,9 +428,9 @@ with st.sidebar:
                 st.session_state.new_title = key # Initial value for title editing
                 st.session_state.temp_system_instruction = st.session_state.system_instructions.get(key, default_system_instruction)
                 
-                # 로드된 대화 이력으로 chat_session을 다시 초기화
+                # 로드된 대화 이력으로 chat_session을 다시 초기화 (현재 선택된 모델 사용)
                 current_instruction = st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction)
-                st.session_state.chat_session = load_main_model(current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
+                st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
 
                 st.session_state.editing_instruction = False
                 st.session_state.editing_title = False
@@ -424,23 +440,45 @@ with st.sidebar:
     # 사이드바의 "⚙️ 설정" 익스팬더 안에 추가
     # UI는 건드리지 않고, 이 안에 Supervision 토글을 넣습니다.
     with st.expander("⚙️ 설정"):
+        st.write("---")
+        st.write("모델 선택")
+        selected_model_option = st.selectbox(
+            "사용할 AI 모델을 선택하세요:",
+            options=AVAILABLE_MODELS,
+            index=AVAILABLE_MODELS.index(st.session_state.selected_model),
+            key="model_selector",
+            disabled=st.session_state.is_generating or st.session_state.delete_confirmation_pending
+        )
+        # 모델이 변경되었는지 확인하고, 변경되었다면 세션 상태 업데이트 및 재실행
+        if selected_model_option != st.session_state.selected_model:
+            st.session_state.selected_model = selected_model_option
+            # 모델 변경 시 chat_session을 새로 선택된 모델로 다시 초기화
+            current_instruction = st.session_state.system_instructions.get(
+                st.session_state.current_title, default_system_instruction
+            )
+            st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(
+                history=convert_to_gemini_format(st.session_state.chat_history)
+            )
+            st.toast(f"AI 모델이 '{st.session_state.selected_model}'으로 변경되었습니다.", icon="🤖")
+            st.rerun()
+
+        st.write("---") # 구분선 추가
+        st.write("Supervision 관련 설정을 변경할 수 있습니다.")
         # Supervision 토글 추가
         st.session_state.use_supervision = st.toggle(
             "Supervision 사용",
             value=st.session_state.use_supervision,
             help="AI 답변의 적절성을 평가하고 필요시 재시도하는 기능을 사용합니다. (기본: 비활성화)",
             key="supervision_toggle",
-            disabled=st.session_state.is_generating
+            disabled=st.session_state.is_generating or st.session_state.delete_confirmation_pending
         )
-        st.write("---") # 구분선 추가
-        st.write("Supervision 관련 설정을 변경할 수 있습니다.")
         # 아래 슬라이더는 Supervision 토글이 활성화되었을 때만 활성화됩니다.
         st.session_state.supervision_max_retries = st.slider(
             "최대 재시도 횟수",
             min_value=1,
             max_value=5,
             value=st.session_state.supervision_max_retries,
-            disabled=st.session_state.is_generating or not st.session_state.use_supervision, # 토글 상태에 따라 비활성화
+            disabled=st.session_state.is_generating or not st.session_state.use_supervision or st.session_state.delete_confirmation_pending, # 토글 상태에 따라 비활성화
             key="supervision_max_retries_slider"
         )
         st.session_state.supervisor_count = st.slider(
@@ -448,7 +486,7 @@ with st.sidebar:
             min_value=1,
             max_value=5,
             value=st.session_state.supervisor_count,
-            disabled=st.session_state.is_generating or not st.session_state.use_supervision, # 토글 상태에 따라 비활성화
+            disabled=st.session_state.is_generating or not st.session_state.use_supervision or st.session_state.delete_confirmation_pending, # 토글 상태에 따라 비활성화
             key="supervisor_count_slider"
         )
         st.session_state.supervision_threshold = st.slider(
@@ -457,7 +495,7 @@ with st.sidebar:
             max_value=100,
             value=st.session_state.supervision_threshold,
             step=5,
-            disabled=st.session_state.is_generating or not st.session_state.use_supervision, # 토글 상태에 따라 비활성화
+            disabled=st.session_state.is_generating or not st.session_state.use_supervision or st.session_state.delete_confirmation_pending, # 토글 상태에 따라 비활성화
             key="supervision_threshold_slider"
         )
         if not st.session_state.use_supervision:
@@ -522,7 +560,7 @@ if st.session_state.delete_confirmation_pending:
                 # Clear the current "새로운 대화"
                 st.session_state.chat_history = []
                 st.session_state.temp_system_instruction = default_system_instruction
-                st.session_state.chat_session = load_main_model(default_system_instruction).start_chat(history=[])
+                st.session_state.chat_session = load_main_model(st.session_state.selected_model, default_system_instruction).start_chat(history=[])
                 st.toast("현재 대화가 초기화되었습니다.", icon="🗑️")
                 # Ensure "새로운 대화" is saved as empty to Firestore
                 st.session_state.saved_sessions["새로운 대화"] = []
@@ -539,7 +577,7 @@ if st.session_state.delete_confirmation_pending:
                     st.session_state.current_title = "새로운 대화"
                     st.session_state.chat_history = []
                     st.session_state.temp_system_instruction = default_system_instruction
-                    st.session_state.chat_session = load_main_model(default_system_instruction).start_chat(history=[])
+                    st.session_state.chat_session = load_main_model(st.session_state.selected_model, default_system_instruction).start_chat(history=[])
                     
                     st.toast(f"'{deleted_title}' 대화가 삭제되었습니다.", icon="🗑️")
                     # Ensure "새로운 대화" is saved as empty if it was the only session left
@@ -580,9 +618,9 @@ if st.session_state.editing_instruction:
                 st.session_state.system_instructions[st.session_state.current_title] = st.session_state.temp_system_instruction
                 st.session_state.saved_sessions[st.session_state.current_title] = st.session_state.chat_history.copy()
                 
-                # 시스템 명령어 변경 시 chat_session을 새 모델로 다시 초기화
+                # 시스템 명령어 변경 시 chat_session을 새 모델로 다시 초기화 (현재 선택된 모델 사용)
                 current_instruction = st.session_state.system_instructions.get(st.session_state.current_title, default_system_instruction)
-                st.session_state.chat_session = load_main_model(current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
+                st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(history=convert_to_gemini_format(st.session_state.chat_history))
                 
                 save_user_data_to_firestore(st.session_state.user_id)
                 st.success("AI 설정이 저장되었습니다.")
@@ -646,7 +684,7 @@ if user_prompt is not None and not st.session_state.is_generating:
         user_input_gemini_parts = []
         # 현재 사용자 프롬프트는 챗봇 히스토리에도 추가될 텍스트입니다.
         # Supervisor 평가 시 '사용자 입력'으로 사용됩니다.
-        user_prompt_for_display_and_eval = user_prompt if user_prompt else "파일 첨부"
+        user_prompt_for_display_and_eval = user_prompt if user_prompt is not None else "파일 첨부"
         
         # 텍스트 프롬프트는 항상 첫 번째 파트로 추가
         # user_prompt가 None일 경우 빈 문자열로 초기화하여 오류 방지
@@ -672,7 +710,7 @@ if user_prompt is not None and not st.session_state.is_generating:
                         # Render page to a high-resolution pixmap
                         # dpi=300 (or higher) for better image quality for OCR/vision tasks
                         pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72)) 
-                        img_bytes = pix.tobytes() # PNG 형식으로 이미지 바이트 얻기
+                        img_bytes = pix.tobytes() # Removed format="png" as it caused an error in some PyMuPDF versions
                         
                         user_input_gemini_parts.append({
                             "inline_data": {
@@ -688,7 +726,6 @@ if user_prompt is not None and not st.session_state.is_generating:
                     pdf_document.close() # 문서 닫기
 
                 except Exception as e:
-                    print(f"PDF 파일 처리 중 오류 발생: {e}. PDF 내용을 포함하지 않고 대화를 계속합니다.")
                     st.error(f"PDF 파일 처리 중 오류 발생: {e}. PDF 내용을 포함하지 않고 대화를 계속합니다.")
             else:
                 st.warning(f"지원되지 않는 파일 형식입니다: {file_type}. 파일 내용을 포함하지 않고 대화를 계속합니다.")
@@ -727,7 +764,7 @@ if st.session_state.regenerate_requested:
                     full_response = ""
 
                     try:
-                        st.session_state.chat_session = load_main_model(current_instruction).start_chat(
+                        st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(
                             history=convert_to_gemini_format(st.session_state.chat_history) 
                         )
                         response_stream = st.session_state.chat_session.send_message(regen_contents_for_model, stream=True)
@@ -784,7 +821,7 @@ if st.session_state.regenerate_requested:
                 message_placeholder.markdown("🤖 답변 재생성 중...")
                 full_response = ""
                 try:
-                    st.session_state.chat_session = load_main_model(current_instruction).start_chat(
+                    st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(
                         history=convert_to_gemini_format(st.session_state.chat_history)
                     )
                     response_stream = st.session_state.chat_session.send_message(regen_contents_for_model, stream=True)
@@ -839,7 +876,7 @@ if user_prompt is not None and not st.session_state.is_generating:
         user_input_gemini_parts = []
         # 현재 사용자 프롬프트는 챗봇 히스토리에도 추가될 텍스트입니다.
         # Supervisor 평가 시 '사용자 입력'으로 사용됩니다.
-        user_prompt_for_display_and_eval = user_prompt if user_prompt else "파일 첨부"
+        user_prompt_for_display_and_eval = user_prompt if user_prompt is not None else "파일 첨부"
         
         # 텍스트 프롬프트는 항상 첫 번째 파트로 추가
         # user_prompt가 None일 경우 빈 문자열로 초기화하여 오류 방지
@@ -865,7 +902,7 @@ if user_prompt is not None and not st.session_state.is_generating:
                         # Render page to a high-resolution pixmap
                         # dpi=300 (or higher) for better image quality for OCR/vision tasks
                         pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72)) 
-                        img_bytes = pix.tobytes(format="png") # PNG 형식으로 이미지 바이트 얻기
+                        img_bytes = pix.tobytes() # Removed format="png" as it caused an error in some PyMuPDF versions
                         
                         user_input_gemini_parts.append({
                             "inline_data": {
@@ -920,7 +957,7 @@ if st.session_state.is_generating and not st.session_state.regenerate_requested:
 
                     try:
                         # 새로운 답변 생성을 위해 chat_session을 이전 대화 히스토리로 다시 초기화합니다.
-                        st.session_state.chat_session = load_main_model(current_instruction).start_chat(
+                        st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(
                             history=convert_to_gemini_format(history_for_main_model)
                         )
 
@@ -980,7 +1017,7 @@ if st.session_state.is_generating and not st.session_state.regenerate_requested:
                 message_placeholder.markdown("🤖 답변 생성 중...")
                 full_response = ""
                 try:
-                    st.session_state.chat_session = load_main_model(current_instruction).start_chat(
+                    st.session_state.chat_session = load_main_model(st.session_state.selected_model, current_instruction).start_chat(
                         history=convert_to_gemini_format(history_for_main_model)
                     )
                     response_stream = st.session_state.chat_session.send_message(initial_contents_for_model, stream=True)
